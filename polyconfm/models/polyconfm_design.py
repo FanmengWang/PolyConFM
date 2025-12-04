@@ -1,0 +1,917 @@
+# Copyright (c) DP Technology.
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+
+import os
+import json
+import math
+import torch
+import yaml
+import math
+import pickle
+import logging
+import torch.nn as nn
+from rdkit import Chem
+from easydict import EasyDict
+from unicore import utils
+from unicore.models import BaseUnicoreModel, register_model, register_model_architecture
+from unicore.modules import init_bert_params
+from unicore.modules import TransformerEncoder, TransformerDecoder
+from functools import partial
+import scipy.stats as stats
+from polyconfm.models.common_module.transformer_encoder_with_pair import TransformerEncoderWithPair
+from polyconfm.models.design_module.diffusion.diffusion_model import Graph_DiT
+from polyconfm.models.design_module.diffusion.distributions import DistributionNodes
+from polyconfm.models.design_module.analysis.visualization import MolecularVisualization
+from polyconfm.models.design_module.metrics.molecular_metrics_sampling import SamplingMolecularMetrics
+from polyconfm.models.design_module.metrics.molecular_metrics_train import TrainMolecularMetricsDiscrete
+
+logger = logging.getLogger(__name__)
+
+@register_model("polyconfm_design")
+class PolyConFMDesignModel(BaseUnicoreModel):
+    @staticmethod
+    def add_args(parser):
+        """Add model-specific arguments to the parser."""
+        parser.add_argument(
+            "--encoder-layers", 
+            type=int, 
+            metavar="L", 
+            help="num encoder layers"
+        )
+        parser.add_argument(
+            "--encoder-embed-dim",
+            type=int,
+            metavar="H",
+            help="encoder embedding dimension",
+        )
+        parser.add_argument(
+            "--encoder-ffn-embed-dim",
+            type=int,
+            metavar="F",
+            help="encoder embedding dimension for FFN",
+        )
+        parser.add_argument(
+            "--encoder-attention-heads",
+            type=int,
+            metavar="A",
+            help="num encoder attention heads",
+        )
+        parser.add_argument(
+            "--dropout", 
+            type=float, 
+            metavar="D", 
+            help="dropout probability"
+        )
+        parser.add_argument(
+            "--emb-dropout",
+            type=float,
+            metavar="D",
+            help="dropout probability for embeddings",
+        )
+        parser.add_argument(
+            "--attention-dropout",
+            type=float,
+            metavar="D",
+            help="dropout probability for attention weights",
+        )
+        parser.add_argument(
+            "--activation-dropout",
+            type=float,
+            metavar="D",
+            help="dropout probability after activation in FFN",
+        )
+        parser.add_argument(
+            "--pooler-dropout",
+            type=float,
+            metavar="D",
+            help="dropout probability in the masked_lm pooler layers",
+        )
+        parser.add_argument(
+            "--max-seq-len", 
+            type=int, 
+            help="number of positional embeddings to learn"
+        )
+        parser.add_argument(
+            "--activation-fn",
+            choices=utils.get_available_activation_fns(),
+            help="activation function to use",
+        )
+        parser.add_argument(
+            "--pooler-activation-fn",
+            choices=utils.get_available_activation_fns(),
+            help="activation function to use for pooler layer",
+        )
+        parser.add_argument(
+            "--post-ln", 
+            type=bool, 
+            help="use post layernorm or pre layernorm"
+        )
+        parser.add_argument(
+            "--delta-pair-repr-norm-loss",
+            type=float,
+            metavar="D",
+            help="delta encoder pair repr norm loss ratio",
+        )
+        parser.add_argument(
+            "--mode",
+            type=str,
+            default="train",
+            choices=["train", "infer"],
+        )
+        parser.add_argument(
+            "--whole-pyg-encoder-type",
+            type=str,
+            default="gin",
+            choices=["gin", "gcn"],
+        )
+        parser.add_argument(
+            "--whole-pyg-encoder-depth",
+            type=int,
+            metavar="H",
+        )
+        parser.add_argument(
+            "--whole-pyg-encoder-embed-dim",
+            type=int,
+            metavar="H",
+        )
+        parser.add_argument(
+            "--whole-pyg-encoder-output-dim",
+            type=int,
+            metavar="H",
+        )
+        parser.add_argument(
+            "--whole-pyg-encoder-dropout",
+            type=float,
+            metavar="H",
+        )
+        parser.add_argument(
+            "--whole-pyg-encoder-pool",
+            type=str,
+        )
+        parser.add_argument(
+            "--mar-encoder-embed-dim",
+            type=int,
+            metavar="H",
+        )
+        parser.add_argument(
+            "--mar-encoder-depth",
+            type=int,
+            metavar="H",
+        )
+        parser.add_argument(
+            "--mar-encoder-num_heads",
+            type=int,
+            metavar="H",
+        )
+        parser.add_argument(
+            "--mar-decoder-embed-dim",
+            type=int,
+            metavar="H",
+        )
+        parser.add_argument(
+            "--mar-decoder-depth",
+            type=int,
+            metavar="H",
+        )
+        parser.add_argument(
+            "--mar-decoder-num_heads",
+            type=int,
+            metavar="H",
+        )
+        parser.add_argument(
+            "--mar-encoder-dropout", 
+            type=float, 
+            metavar="D", 
+            help="dropout probability"
+        )
+        parser.add_argument(
+            "--mar-encoder-emb-dropout",
+            type=float,
+            metavar="D",
+            help="dropout probability for embeddings",
+        )
+        parser.add_argument(
+            "--mar-encoder-attention-dropout",
+            type=float,
+            metavar="D",
+            help="dropout probability for attention weights",
+        )
+        parser.add_argument(
+            "--mar-encoder-activation-dropout",
+            type=float,
+            metavar="D",
+            help="dropout probability after activation in FFN",
+        )
+        parser.add_argument(
+            "--mar-encoder-activation-fn",
+            choices=utils.get_available_activation_fns(),
+            help="activation function to use",
+        )
+        parser.add_argument(
+            "--mar-decoder-dropout", 
+            type=float, 
+            metavar="D", 
+            help="dropout probability"
+        )
+        parser.add_argument(
+            "--mar-decoder-emb-dropout",
+            type=float,
+            metavar="D",
+            help="dropout probability for embeddings",
+        )
+        parser.add_argument(
+            "--mar-decoder-attention-dropout",
+            type=float,
+            metavar="D",
+            help="dropout probability for attention weights",
+        )
+        parser.add_argument(
+            "--mar-decoder-activation-dropout",
+            type=float,
+            metavar="D",
+            help="dropout probability after activation in FFN",
+        )
+        parser.add_argument(
+            "--mar-decoder-activation-fn",
+            choices=utils.get_available_activation_fns(),
+            help="activation function to use",
+        )
+        parser.add_argument(
+            "--mar-max-seq-len",
+            type=int,
+            metavar="D",
+        )
+        parser.add_argument(
+            "--mar-label-drop-prob",
+            type=float,
+            metavar="D",
+        )
+        parser.add_argument(
+            "--mar_mask_ratio_lower_bound",
+            type=float,
+            metavar="D",
+        )
+        parser.add_argument(
+            "--mar-num-ar-steps",
+            type=int,
+            metavar="D",
+        )
+        parser.add_argument(
+            "--mar-cfg",
+            type=float,
+            default=1.0,
+            metavar="D",
+        )
+        parser.add_argument(
+            "--mar-cfg-schedule",
+            type=str,
+            default="linear",
+            choices=["linear", "constant"],
+        )
+        parser.add_argument(
+            "--mar-diff-in-node-features", 
+            type=int, 
+            default=45
+        )
+        parser.add_argument(
+            "--mar-diff-in-edge-features", 
+            type=int, 
+            default=4
+        )
+        parser.add_argument(
+            "--mar-diff-batch-mul", 
+            type=int, 
+            default=4
+        )
+        parser.add_argument(
+            "--mar-diff-ns", 
+            type=int, 
+            default=32, 
+            help="Number of hidden features per node of order 0"
+        )
+        parser.add_argument(
+            "--mar-diff-nv", 
+            type=int, 
+            default=8, 
+            help="Number of hidden features per node of orser >0"
+        )
+        parser.add_argument(
+            "--mar-diff-sigma-embed-dim", 
+            type=int, 
+            default=32, 
+            help="Dimension of sinusoidal embedding of sigma"
+        )
+        parser.add_argument(
+            "--mar-diff-sigma-min", 
+            type=float, 
+            default=0.01*3.14, 
+            help="Minimum sigma used for training"
+        )
+        parser.add_argument(
+            "--mar-diff-sigma-max", 
+            type=float, 
+            default=3.14, 
+            help="Maximum sigma used for training"
+        )
+        parser.add_argument(
+            "--mar-diff-num-conv-layers", 
+            type=int, 
+            default=4, 
+            help="Number of interaction layers"
+        )
+        parser.add_argument(
+            "--mar-diff-max-radius", 
+            type=float, 
+            default=5.0, 
+            help="Radius cutoff for geometric graph"
+        )
+        parser.add_argument(
+            "--mar-diff-radius-embed-dim", 
+            type=int, 
+            default=50, 
+            help="Dimension of embedding of distances"
+        )
+        parser.add_argument(
+            "--mar-diff-scale-by-sigma", 
+            action='store_true', 
+            default=True, 
+            help="Whether to normalise the score"
+        )
+        parser.add_argument(
+            "--mar-diff-no-residual", 
+            action='store_true', 
+            default=False, 
+            help="If set, it removes residual connection"
+        )
+        parser.add_argument(
+            "--mar-diff-no-batch-norm", 
+            action='store_true', 
+            default=False, 
+            help="If set, it removes the batch norm"
+        )
+        parser.add_argument(
+            "--mar-diff-use-second-order-repr", 
+            action='store_true', 
+            default=False, 
+            help="Whether to use only up to first order representations or also second"
+        )
+        parser.add_argument(
+            "--mar-diff-pre-mmff", 
+            action='store_true', 
+            default=False, 
+            help='Whether to run MMFF on the local structure conformer'
+        )
+        parser.add_argument(
+            "--mar-diff-post-mmff", 
+            action='store_true', 
+            default=False, 
+            help='Whether to run MMFF on the final generated structures'
+        )
+        parser.add_argument(
+            "--mar-diff-no-random", 
+            action='store_true', 
+            default=False, 
+            help='Whether avoid randomising the torsions of the seed conformer'
+        )
+        parser.add_argument(
+            "--mar-diff-no-model", 
+            action='store_true', 
+            default=False, 
+            help='Whether to return seed conformer without running model'
+        )
+        parser.add_argument(
+            "--mar-diff-single-conf", 
+            action='store_true', 
+            default=False, 
+            help='Whether to start from a single local structure'
+        )
+        parser.add_argument(
+            "--mar-diff-inference-steps", 
+            type=int, 
+            default=20, 
+            help='Number of denoising steps'
+        )
+        parser.add_argument(
+            "--mar-diff-confs-per-mol", 
+            type=int, 
+            default=1, 
+            help='If set for every molecule this number of conformers is generated'
+        )
+        parser.add_argument(
+            "--mar-diff-ode", 
+            action='store_true', 
+            default=False, 
+            help='Whether to run the probability flow ODE instead of the SDE'
+        )
+        parser.add_argument(
+            "--mar-diff-likelihood", 
+            choices=['full', 'hutch'], 
+            default=None, 
+            help='Technique to compute likelihood'
+        )
+        parser.add_argument(
+            "--mar-diff-dump_pymol", 
+            type=str, 
+            default=None, 
+            help="Whether to save .pdb file with denoising dynamics"
+        )
+        parser.add_argument(
+            "--mar-diff-water", 
+            action='store_true', 
+            default=False, 
+            help='Whether to compute xTB energy in water'
+        )
+        parser.add_argument(
+            "--mar-diff-batch-size", 
+            type=int, 
+            default=32, 
+            help='Number of conformers generated in parallel'
+        )
+        parser.add_argument(
+            "--mar-diff-xtb", 
+            type=str, 
+            default=None, 
+            help='If set, it indicates path to local xtb main directory'
+        )
+        parser.add_argument(
+            "--mar-diff-no-energy", 
+            action='store_true', 
+            default=False, 
+            help='If set skips computation of likelihood, energy etc'
+        )
+        parser.add_argument(
+            "--mar-diff-pg-weight-log-0", 
+            type=float, 
+            default=None
+        )
+        parser.add_argument(
+            "--mar-diff-pg-weight-log-1", 
+            type=float, 
+            default=None
+        )
+        parser.add_argument(
+            "--mar-diff-pg-repulsive-weight-log-0", 
+            type=float, 
+            default=None
+        )
+        parser.add_argument(
+            "--mar-diff-pg-repulsive-weight-log-1", 
+            type=float, 
+            default=None
+        )
+        parser.add_argument(
+            "--mar-diff-pg-langevin-weight-log-0", 
+            type=float, 
+            default=None
+        )
+        parser.add_argument(
+            "--mar-diff-pg-langevin-weight-log-1", 
+            type=float, 
+            default=None
+        )
+        parser.add_argument(
+            "--mar-diff-pg-kernel-size-log-0", 
+            type=float, 
+            default=None
+        )
+        parser.add_argument(
+            "--mar-diff-pg-kernel-size-log-1", 
+            type=float, 
+            default=None
+        )
+        parser.add_argument(
+            "--mar-diff-pg-invariant", 
+            type=bool, 
+            default=False
+        )
+        parser.add_argument(
+            "--mar-norm-layer",
+            default=partial(nn.LayerNorm, eps=1e-6),
+        )
+        parser.add_argument(
+            "--ensure-connected", 
+            type=bool, 
+            default=True
+        )
+        parser.add_argument(
+            "--sample-batch", 
+            type=int, 
+            default=125
+        )
+        
+    def __init__(self, args, dictionary):
+        super().__init__()
+        base_architecture(args)
+        self.args = args
+        self._num_updates = None
+        self.dictionary = dictionary
+        
+        # --------------------------------------------------------------------------
+        # Whole pyg encoder basic specifics
+        if args.whole_pyg_encoder_type == 'gin':
+            from polyconfm.models.common_module.ginet_molclr import GINet
+            self.whole_pyg_encoder = GINet(num_layer=args.whole_pyg_encoder_depth, emb_dim=args.whole_pyg_encoder_embed_dim, feat_dim=args.whole_pyg_encoder_output_dim, 
+                                           drop_ratio=args.whole_pyg_encoder_dropout, pool=args.whole_pyg_encoder_pool)
+        elif args.whole_pyg_encoder_type == 'gcn':
+            from polyconfm.models.common_module.gcn_molclr import GCN
+            self.whole_pyg_encoder = GCN(num_layer=args.whole_pyg_encoder_depth, emb_dim=args.whole_pyg_encoder_embed_dim, feat_dim=args.whole_pyg_encoder_output_dim, 
+                                           drop_ratio=args.whole_pyg_encoder_dropout, pool=args.whole_pyg_encoder_pool)
+            
+        # --------------------------------------------------------------------------
+        # Repeat unit encoder basic specifics
+        K = 128
+        self.padding_idx = dictionary.pad()
+        n_edge_type = len(dictionary) * len(dictionary)
+        self.embed_tokens = nn.Embedding(
+            len(dictionary), args.encoder_embed_dim, self.padding_idx
+        )
+        self.gbf_proj = NonLinearHead(
+            K, args.encoder_attention_heads, args.activation_fn
+        )
+        self.gbf = GaussianLayer(K, n_edge_type)
+        
+        self.repeat_unit_encoder = TransformerEncoderWithPair(
+            encoder_layers=args.encoder_layers,
+            embed_dim=args.encoder_embed_dim,
+            ffn_embed_dim=args.encoder_ffn_embed_dim,
+            attention_heads=args.encoder_attention_heads,
+            emb_dropout=args.emb_dropout,
+            dropout=args.dropout,
+            attention_dropout=args.attention_dropout,
+            activation_dropout=args.activation_dropout,
+            max_seq_len=args.max_seq_len,
+            activation_fn=args.activation_fn,
+            no_final_head_layer_norm=args.delta_pair_repr_norm_loss < 0,
+        )
+        
+        # --------------------------------------------------------------------------
+        # MAR basic specifics
+        self.mar_fake_latent = nn.Parameter(torch.zeros(1, args.mar_encoder_embed_dim))
+        self.mar_mask_ratio_generator = stats.truncnorm((args.mar_mask_ratio_lower_bound - 1.0) / 0.25, 0, loc=1.0, scale=0.25)
+        
+        # --------------------------------------------------------------------------
+        # MAR encoder specifics
+        self.mar_token_embed_dim = args.encoder_embed_dim + (args.whole_pyg_encoder_output_dim // 2)
+        self.mar_z_proj = nn.Linear(self.mar_token_embed_dim, args.mar_encoder_embed_dim, bias=True)
+        self.mar_class_embedding_proj = nn.Linear(768, args.mar_encoder_embed_dim, bias=True)
+        self.mar_z_proj_ln = nn.LayerNorm(args.mar_encoder_embed_dim, eps=1e-6)
+        self.mar_encoder_pos_embed_learned = RotaryPositionEmbedding(args.mar_encoder_embed_dim)
+        
+        self.mar_encoder = TransformerEncoder(
+            encoder_layers=args.mar_encoder_depth,
+            embed_dim=args.mar_encoder_embed_dim,
+            ffn_embed_dim=(args.mar_encoder_embed_dim * 4),
+            attention_heads=args.mar_encoder_num_heads,
+            emb_dropout=args.mar_encoder_emb_dropout,
+            dropout=args.mar_encoder_dropout,
+            attention_dropout=args.mar_encoder_attention_dropout,
+            activation_dropout=args.mar_encoder_activation_dropout,
+            activation_fn=args.mar_encoder_activation_fn,
+            max_seq_len=args.mar_max_seq_len,
+        )
+        self.mar_encoder_norm = args.mar_norm_layer(args.mar_encoder_embed_dim)
+        
+        # --------------------------------------------------------------------------
+        # MAR decoder specifics
+        self.mar_decoder_embed = nn.Linear(args.mar_encoder_embed_dim, args.mar_decoder_embed_dim, bias=True)
+        self.mar_mask_token = nn.Parameter(torch.zeros(1, 1, args.mar_decoder_embed_dim))
+        self.mar_decoder_pos_embed_learned = RotaryPositionEmbedding(args.mar_decoder_embed_dim)
+        
+        self.mar_decoder = TransformerDecoder(
+            decoder_layers=args.mar_decoder_depth,
+            embed_dim=args.mar_decoder_embed_dim,
+            ffn_embed_dim=(args.mar_decoder_embed_dim * 4),
+            attention_heads=args.mar_decoder_num_heads,
+            emb_dropout=args.mar_decoder_emb_dropout,
+            dropout=args.mar_decoder_dropout,
+            attention_dropout=args.mar_decoder_attention_dropout,
+            activation_dropout=args.mar_decoder_activation_dropout,
+            activation_fn=args.mar_decoder_activation_fn,
+            max_seq_len=args.mar_max_seq_len,
+        )
+        self.mar_decoder_norm = args.mar_norm_layer(args.mar_decoder_embed_dim)
+        self.mar_diffusion_pos_embed_learned = RotaryPositionEmbedding(args.mar_decoder_embed_dim)
+
+        # --------------------------------------------------------------------------
+        # Design module specifics
+        dataset_infos = DataInfos(self.args.data, self.args.task_name, self.args.ensure_connected)
+        train_smiles = get_psmi_list(self.args.data, 'train')
+        reference_smiles = get_psmi_list(self.args.data, 'test')
+        train_metrics = TrainMolecularMetricsDiscrete(dataset_infos)
+        sampling_metrics = SamplingMolecularMetrics(
+            dataset_infos, train_smiles, reference_smiles
+        )
+        visualization_tools = MolecularVisualization(dataset_infos)
+        model_kwargs = {
+            "dataset_infos": dataset_infos,
+            "train_metrics": train_metrics,
+            "sampling_metrics": sampling_metrics,
+            "visualization_tools": visualization_tools,
+        }
+        with open(f'polyconfm/models/design_module/config.yaml', 'r') as f:
+            self.design_module_config = EasyDict(yaml.safe_load(f))
+        self.design_module = Graph_DiT(cfg=self.design_module_config, **model_kwargs)
+        self.design_module_whole_condition = nn.Linear(args.mar_decoder_embed_dim, self.design_module_config.model.hidden_size, bias=True)
+        self.apply(init_bert_params)
+
+
+    @classmethod
+    def build_model(cls, args, task):
+        """Build a new model instance."""
+        return cls(args, task.dictionary)
+
+
+    def forward_mae_encoder(self, x, mask, padding_mask, class_embedding, buffer_size):
+        x = self.mar_z_proj(x)
+        class_embedding = self.mar_class_embedding_proj(class_embedding)
+        bsz, seq_len, embed_dim = x.shape
+        
+        # concat buffer
+        x = torch.cat([torch.zeros(bsz, buffer_size, embed_dim, device=x.device).to(x.dtype), x], dim=1)
+        mask_with_buffer = torch.cat([torch.zeros(bsz, buffer_size, device=x.device).to(mask.dtype), mask], dim=1)
+        padding_mask_with_buffer = torch.cat([torch.zeros(bsz, buffer_size, device=x.device).to(padding_mask.dtype), padding_mask], dim=1)
+        
+        # random drop class embedding during training
+        if self.training:
+            drop_latent_mask = torch.rand(bsz) < self.args.mar_label_drop_prob
+            drop_latent_mask = drop_latent_mask.unsqueeze(-1).cuda().to(x.dtype)
+            class_embedding = drop_latent_mask * self.mar_fake_latent + (1 - drop_latent_mask) * class_embedding
+        x[:, :buffer_size] = class_embedding.unsqueeze(1)
+        
+        # encoder position embedding
+        x = self.mar_encoder_pos_embed_learned.rotate(x)
+        x = self.mar_z_proj_ln(x)
+        x = self.mar_encoder(x, padding_mask=torch.bitwise_or(mask_with_buffer.bool(), padding_mask_with_buffer.bool()))  # Don't consider mask or padding positions
+        x = self.mar_encoder_norm(x)
+        
+        return x
+    
+
+    def forward(
+        self,
+        psmi_rep,
+        whole_pyg,
+        repeat_unit_pyg, 
+        repeat_unit_smi,
+        repeat_unit_actual_num,
+        src_tokens,
+        src_edge_type,
+        src_coord,
+        src_distance,
+        **kwargs
+    ):  
+        bsz = src_coord.shape[0]
+        repeat_unit_num = src_coord.shape[1] 
+        repeat_unit_atom_num = src_coord.shape[2]
+        
+        # Whole pyg encoder
+        whole_pyg_batch = whole_pyg.to(src_tokens.device)        
+        garph_attr = self.whole_pyg_encoder(whole_pyg_batch)
+        graph_global_att = garph_attr.unsqueeze(1)  # (bsz, d) -> (bsz, 1, d)
+
+        # Repeat unit encoder
+        assert src_tokens.shape[0] == bsz and src_tokens.shape[1] == repeat_unit_atom_num
+        assert src_edge_type.shape[0] == bsz and src_edge_type.shape[1] == repeat_unit_atom_num and src_edge_type.shape[1] == repeat_unit_atom_num
+        src_tokens = src_tokens.unsqueeze(1).repeat(1, repeat_unit_num, 1).reshape(-1, repeat_unit_atom_num)  # (bsz, n) -> (bsz, 1, n) -> (bsz, r_n, n) -> (bsz * r_n, n)
+        src_edge_type = src_edge_type.unsqueeze(1).repeat(1, repeat_unit_num, 1, 1).reshape(-1, repeat_unit_atom_num, repeat_unit_atom_num)  # (bsz, n, n) -> (bsz, 1, n, n) -> (bsz, r_n, n, n) -> (bsz * r_n, n, n)
+        src_coord = src_coord.reshape(-1, repeat_unit_atom_num, 3)  # (bsz, r_n, n, 3) -> (bsz * r_n, n, 3)     
+        src_distance = src_distance.reshape(-1, repeat_unit_atom_num, repeat_unit_atom_num)  # (bsz, r_n, n, n) -> (bsz * r_n, n, n) 
+        
+        padding_mask = src_tokens.eq(self.padding_idx)
+        if not padding_mask.any():
+            padding_mask = None
+        x = self.embed_tokens(src_tokens)
+                
+        def get_dist_features(dist, et):
+            n_node = dist.size(-1)
+            gbf_feature = self.gbf(dist, et)
+            gbf_result = self.gbf_proj(gbf_feature)
+            graph_attn_bias = gbf_result
+            graph_attn_bias = graph_attn_bias.permute(0, 3, 1, 2).contiguous()
+            graph_attn_bias = graph_attn_bias.view(-1, n_node, n_node)
+            return graph_attn_bias
+
+        graph_attn_bias = get_dist_features(src_distance, src_edge_type) 
+        encoder_rep, _ , _ , _, _ = self.repeat_unit_encoder(x, padding_mask=padding_mask, attn_mask=graph_attn_bias) # (bsz * r_n, n, d)
+        
+        # MAR encoder
+        mar_x = torch.cat([encoder_rep[:, 0, :].reshape(bsz, -1, encoder_rep.shape[-1]), graph_global_att.repeat(1, repeat_unit_num, 1)], dim=-1)  # (bsz, r_n, d)     
+        mar_mask = torch.zeros(bsz, repeat_unit_num, device=mar_x.device) # (bsz, r_n)            
+        mar_class_embedding = psmi_rep.to(mar_x.dtype) # (bsz, 768)
+        mar_buffer_size = max(math.floor(min(repeat_unit_actual_num) / 4), 1)                
+        mar_padding_mask = torch.zeros((bsz, mar_x.shape[1]), dtype=torch.bool).to(src_tokens.device)   
+        for idx, num in enumerate(repeat_unit_actual_num):
+            mar_padding_mask[idx, num:] = True
+        mar_x = self.forward_mae_encoder(mar_x, mar_mask, mar_padding_mask, mar_class_embedding, mar_buffer_size).detach()  # (bsz, mar_buffer_size + r_n, d)
+
+        # Design
+        mar_x = mar_x[:, mar_buffer_size:]
+        mar_x = masked_mean_pooling(x=mar_x, padding_mask=mar_padding_mask)
+        whole_condition = self.design_module_whole_condition(mar_x)
+        if self.args.mode != 'infer':   
+            loss = self.design_module.training_step(repeat_unit_pyg, whole_condition, src_tokens.device)
+            return loss
+        else:
+            sample, batch_y = self.design_module.sampling_step(repeat_unit_pyg, whole_condition, src_tokens.device, self.args.sample_batch)
+            return {'sample': sample, 'batch_y': batch_y}
+
+
+    def set_num_updates(self, num_updates):
+        """State from trainer to pass along to model at every update."""
+        self._num_updates = num_updates
+
+
+    def get_num_updates(self):
+        return self._num_updates
+    
+
+def masked_mean_pooling(x, padding_mask):  
+    valid_mask = ~padding_mask  # (bsz, n)  
+    valid_mask = valid_mask.unsqueeze(-1).float()  # (bsz, n, 1)  
+    weighted_sum = torch.sum(x * valid_mask, dim=1)  # (bsz, d)   
+    valid_counts = torch.sum(valid_mask, dim=1)  # (bsz, 1)  
+    valid_counts = valid_counts.clamp_min(1e-6) 
+    mean_pooled_features = weighted_sum / valid_counts  # (bsz, d)  
+    return mean_pooled_features  
+
+
+class RotaryPositionEmbedding:  
+    def __init__(self, d_model, base=10000):  
+        self.d_model = d_model  
+        self.base = base  
+
+    def rotate(self, x):  
+        # x shape: (batch_size, seq_len, d_model)  
+        seq_len = x.size(1)  
+
+        # calculate position
+        positions = torch.arange(seq_len, dtype=torch.float32, device=x.device).unsqueeze(1)  # (seq_len, 1)  
+        frequencies = 1 / (self.base ** (torch.arange(0, self.d_model, 2, dtype=torch.float32, device=x.device) / self.d_model))  
+        angles = positions * frequencies.unsqueeze(0)  # (seq_len, d_model // 2)  
+
+        # calculate sin and cos value  
+        sin = angles.sin()  
+        cos = angles.cos()  
+
+        # extent sin and cos
+        sin_cos = torch.zeros(seq_len, self.d_model, device=x.device)  
+        sin_cos[:, 0::2] = sin  
+        sin_cos[:, 1::2] = cos  
+        sin_cos = sin_cos.unsqueeze(0)  # (1, seq_len, d_model)  
+        
+        # rotation
+        x_rotated = (x * sin_cos) + (torch.cat([x[..., 1::2], x[..., ::2]], dim=-1) * sin_cos)  
+        return x_rotated
+    
+
+class NonLinearHead(nn.Module):
+    """Head for simple classification tasks."""
+
+    def __init__(
+        self,
+        input_dim,
+        out_dim,
+        activation_fn,
+        hidden=None,
+    ):
+        super().__init__()
+        hidden = input_dim if not hidden else hidden
+        self.linear1 = nn.Linear(input_dim, hidden)
+        self.linear2 = nn.Linear(hidden, out_dim)
+        self.activation_fn = utils.get_activation_fn(activation_fn)
+
+    def forward(self, x):
+        x = self.linear1(x)
+        x = self.activation_fn(x)
+        x = self.linear2(x)
+        return x
+
+
+@torch.jit.script
+def gaussian(x, mean, std):
+    pi = 3.14159
+    a = (2 * pi) ** 0.5
+    return torch.exp(-0.5 * (((x - mean) / std) ** 2)) / (a * std)
+
+
+class GaussianLayer(nn.Module):
+    def __init__(self, K=128, edge_types=1024):
+        super().__init__()
+        self.K = K
+        self.means = nn.Embedding(1, K)
+        self.stds = nn.Embedding(1, K)
+        self.mul = nn.Embedding(edge_types, 1)
+        self.bias = nn.Embedding(edge_types, 1)
+        nn.init.uniform_(self.means.weight, 0, 3)
+        nn.init.uniform_(self.stds.weight, 0, 3)
+        nn.init.constant_(self.bias.weight, 0)
+        nn.init.constant_(self.mul.weight, 1)
+
+    def forward(self, x, edge_type):
+        mul = self.mul(edge_type).type_as(x)
+        bias = self.bias(edge_type).type_as(x)
+        x = mul * x.unsqueeze(-1) + bias
+        x = x.expand(-1, -1, -1, self.K)
+        mean = self.means.weight.float().view(-1)
+        std = self.stds.weight.float().view(-1).abs() + 1e-5
+        return gaussian(x.float(), mean, std).type_as(self.means.weight)
+
+
+class DataInfos():
+    def __init__(self, data_path, task_name, ensure_connected):
+        tasktype_dict = {
+            'O2': 'regression',
+            'N2': 'regression',
+            'CO2': 'regression',
+        }
+        self.task = task_name
+        self.task_type = tasktype_dict.get(task_name, "regression")
+        self.ensure_connected = ensure_connected
+
+        meta_filename = os.path.join(data_path, f'{task_name}.meta.json')
+        with open(meta_filename, 'r') as f:
+            meta_dict = json.load(f)
+
+        self.base_path = data_path
+        self.active_atoms = meta_dict['active_atoms']
+        self.max_n_nodes = meta_dict['max_node']
+        self.original_max_n_nodes = meta_dict['max_node']
+        self.n_nodes = torch.Tensor(meta_dict['n_atoms_per_mol_dist'])
+        self.edge_types = torch.Tensor(meta_dict['bond_type_dist'])
+        self.transition_E = torch.Tensor(meta_dict['transition_E'])
+
+        self.atom_decoder = meta_dict['active_atoms']
+        node_types = torch.Tensor(meta_dict['atom_type_dist'])
+        active_index = (node_types > 0).nonzero().squeeze()
+        self.node_types = torch.Tensor(meta_dict['atom_type_dist'])[active_index]
+        self.nodes_dist = DistributionNodes(self.n_nodes)
+        self.active_index = active_index
+
+        val_len = 3 * self.original_max_n_nodes - 2
+        meta_val = torch.Tensor(meta_dict['valencies'])
+        self.valency_distribution = torch.zeros(val_len)
+        val_len = min(val_len, len(meta_val))
+        self.valency_distribution[:val_len] = meta_val[:val_len]
+        self.y_prior = None
+        self.train_ymin = []
+        self.train_ymax = []
+
+        self.input_dims = {'X': len(self.active_index), 
+                           'E': 5, 
+                           'y': 2 + len(task_name.split('-'))}
+        self.output_dims = {'X': len(self.active_index),
+                            'E': 5,
+                            'y': 2 + len(task_name.split('-'))}
+
+
+def get_psmi_list(data_path, split_name):
+    with open(os.path.join(data_path, f'{split_name}_psmi.pkl'), 'rb') as file:  
+        psmi_list = list(pickle.load(file))
+    psmi_list = [Chem.MolToSmiles(Chem.MolFromSmiles(psmi)) for psmi in psmi_list]
+    return psmi_list
+
+
+@register_model_architecture("polyconfm_design", "polyconfm_design")
+def base_architecture(args):
+    # Repeat unit encoder basic specifics
+    args.encoder_layers = getattr(args, "encoder_layers", 15)
+    args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 512)
+    args.encoder_ffn_embed_dim = getattr(args, "encoder_ffn_embed_dim", 2048)
+    args.encoder_attention_heads = getattr(args, "encoder_attention_heads", 64)
+    args.dropout = getattr(args, "dropout", 0.1)
+    args.emb_dropout = getattr(args, "emb_dropout", 0.1)
+    args.attention_dropout = getattr(args, "attention_dropout", 0.1)
+    args.activation_dropout = getattr(args, "activation_dropout", 0.0)
+    args.pooler_dropout = getattr(args, "pooler_dropout", 0.0)
+    args.max_seq_len = getattr(args, "max_seq_len", 512)
+    args.activation_fn = getattr(args, "activation_fn", "gelu")
+    args.pooler_activation_fn = getattr(args, "pooler_activation_fn", "tanh")
+    args.post_ln = getattr(args, "post_ln", False)
+    args.delta_pair_repr_norm_loss = getattr(args, "delta_pair_repr_norm_loss", -1.0)
+    # Whole pyg encoder basic specifics
+    args.whole_pyg_encoder_depth = getattr(args, "whole_pyg_encoder_depth", 5)
+    args.whole_pyg_encoder_embed_dim = getattr(args, "whole_pyg_encoder_embed_dim", 300)
+    args.whole_pyg_encoder_output_dim = getattr(args, "whole_pyg_encoder_output_dim", 512)
+    args.whole_pyg_encoder_dropout = getattr(args, "whole_pyg_encoder_dropout", 0)
+    args.whole_pyg_encoder_pool = getattr(args, "whole_pyg_encoder_pool", "mean")
+    # MAR basic specifics
+    args.mar_encoder_embed_dim = getattr(args, "mar_encoder_embed_dim", 768)
+    args.mar_encoder_depth = getattr(args, "mar_encoder_depth", 6)
+    args.mar_encoder_num_heads = getattr(args, "mar_encoder_num_heads", 12)
+    args.mar_decoder_embed_dim = getattr(args, "mar_decoder_embed_dim", 768)
+    args.mar_decoder_depth = getattr(args, "mar_decoder_depth", 6)
+    args.mar_decoder_num_heads = getattr(args, "mar_decoder_num_heads", 12)
+    args.mar_encoder_dropout = getattr(args, "mar_encoder_dropout", 0.1)
+    args.mar_encoder_emb_dropout = getattr(args, "mar_encoder_emb_dropout", 0.1)
+    args.mar_encoder_attention_dropout = getattr(args, "mar_encoder_attention_dropout", 0.1)
+    args.mar_encoder_activation_dropout = getattr(args, "mar_encoder_activation_dropout", 0.0)
+    args.mar_encoder_activation_fn = getattr(args, "mar_encoder_activation_fn", "gelu")
+    args.mar_decoder_dropout = getattr(args, "mar_decoder_dropout", 0.1)
+    args.mar_decoder_emb_dropout = getattr(args, "mar_decoder_emb_dropout", 0.1)
+    args.mar_decoder_attention_dropout = getattr(args, "mar_decoder_attention_dropout", 0.1)
+    args.mar_decoder_activation_dropout = getattr(args, "mar_decoder_activation_dropout", 0.0)
+    args.mar_decoder_activation_fn = getattr(args, "mar_decoder_activation_fn", "gelu")
+    args.mar_max_seq_len = getattr(args, "mar_max_seq_len", 1024)
+    args.mar_label_drop_prob = getattr(args, "mar_label_drop_prob", 0.1)
+    args.mar_mask_ratio_lower_bound = getattr(args, "mar_mask_ratio_lower_bound", 0.7)
