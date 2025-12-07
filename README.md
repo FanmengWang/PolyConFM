@@ -3,7 +3,7 @@
 
 # Unifying Polymer Modeling and Design via a Conformation-Centric Generative Foundation Model
 
-[![arXiv](https://img.shields.io/badge/arXiv-22504.08859-b31b1b?style=flat&logo=arxiv)](https://arxiv.org/abs/2510.16023)
+[![arXiv](https://img.shields.io/badge/arXiv-2510.16023-b31b1b?style=flat&logo=arxiv)](https://arxiv.org/abs/2510.16023)
 [![Checkpoint](https://img.shields.io/badge/Download-Checkpoint-brightgreen?style=flat&logo=zenodo)](https://zenodo.org/records/17577742)
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue?logo=gnu)](LICENSE)
 
